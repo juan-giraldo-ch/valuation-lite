@@ -5,8 +5,8 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import yfinance as yf
 from datetime import datetime, timedelta
+from alpha_vantage import AlphaVantageTicker
 from valuation_enhanced import ValuationCache
 
 cache = ValuationCache()
@@ -567,7 +567,7 @@ def _compute_observed_fundamental_drivers(ticker, fundamentals_payload, history_
 def get_monthly_price_candles(ticker: str, start_date, end_date):
     """Fetch true monthly OHLC candles for a ticker within the requested window."""
     try:
-        stock = yf.Ticker(ticker)
+        stock = AlphaVantageTicker(ticker)
         monthly = stock.history(
             start=pd.Timestamp(start_date) - pd.Timedelta(days=35),
             end=pd.Timestamp(end_date) + pd.Timedelta(days=7),
@@ -760,7 +760,7 @@ def get_fundamentals_payload(ticker: str, months_back: int):
     }
 
     try:
-        stock = yf.Ticker(ticker)
+        stock = AlphaVantageTicker(ticker)
         info = stock.info or {}
     except Exception as exc:
         payload["status_messages"].append(f"Could not load fundamentals for {ticker}: {exc}")

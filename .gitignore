@@ -1,0 +1,4 @@
+.venv/
+.streamlit/secrets.toml
+cache/valuation_history/
+__pycache__/

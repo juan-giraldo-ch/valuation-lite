@@ -20,6 +20,7 @@ from valuation_enhanced import (
     compute_historical_valuations,
     compute_valuation_enhanced,
 )
+from sector_config import SECTOR_CONFIGS
 from mobile_valuation_history import (
     build_valuation_history_frame,
     compute_valuation_history_insight,
@@ -69,9 +70,9 @@ def normalized_ticker(raw):
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def current_valuation(ticker: str, refresh_key: int):
+def current_valuation(ticker: str, refresh_key: int, sector_override: str | None = None):
     # refresh_key is only used to expire one session's cached result on request.
-    return compute_valuation_enhanced(ticker)
+    return compute_valuation_enhanced(ticker, sector_override=sector_override)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -277,7 +278,7 @@ def _history_chart(df, currency):
     return fig
 
 
-def render_history(ticker, result):
+def render_history(ticker, result, sector_override=None):
     st.subheader("Historical valuation")
     df = build_valuation_history_frame(ticker)
     if df.empty:
@@ -312,11 +313,15 @@ def render_history(ticker, result):
             st.info(insight.get("message", "Historical comparison unavailable."))
 
     with st.expander("Generate or refresh historical valuations"):
-        st.warning("A historical backfill may trigger many Yahoo Finance requests and take significant time. It also writes local JSON history, which is temporary on Community Cloud.")
+        st.warning("A historical backfill uses monthly price data and several Alpha Vantage requests. The free key is limited to 25 requests per day; cached responses reduce repeat calls. Saved JSON history is temporary on Community Cloud.")
         months = st.select_slider("Lookback (months)", options=(6, 12, 24, 36, 48, 60), value=24)
         if st.button("Generate history", type="primary", use_container_width=True):
             with st.spinner(f"Calculating {months} months of historical valuations for {ticker}…"):
-                hist = compute_historical_valuations(ticker, months_back=months)
+                hist = compute_historical_valuations(
+                    ticker,
+                    months_back=months,
+                    sector_override=sector_override,
+                )
                 if not isinstance(hist, dict) or hist.get("error"):
                     st.error((hist or {}).get("error", "Historical backfill failed."))
                 else:
@@ -348,7 +353,7 @@ def main():
     if submitted:
         new_ticker = normalized_ticker(ticker_input)
         if new_ticker is None:
-            st.error("Enter a valid Yahoo Finance ticker (letters, numbers, dot, dash or ^).")
+            st.error("Enter a ticker using letters, numbers, dot, dash or ^, and make sure Alpha Vantage supports that listing.")
             st.stop()
         st.session_state.mobile_active_ticker = new_ticker
         st.query_params["ticker"] = new_ticker
@@ -366,10 +371,16 @@ def main():
         st.session_state.mobile_refresh_key = 0
     if refresh:
         st.session_state.mobile_refresh_key += 1
+    sector_override_key = f"mobile_sector_override_{selected}"
+    sector_override = st.session_state.get(sector_override_key)
 
     with st.spinner(f"Valuing {selected}…"):
         try:
-            result = current_valuation(selected, st.session_state.mobile_refresh_key)
+            result = current_valuation(
+                selected,
+                st.session_state.mobile_refresh_key,
+                sector_override,
+            )
         except Exception as exc:
             st.error(f"Valuation could not be completed: {exc}")
             st.stop()
@@ -378,9 +389,30 @@ def main():
         st.stop()
 
     st.subheader(f"{result.get('name') or selected}")
-    st.caption(f"{selected} · {result.get('sector') or 'Unknown sector'} · Quote {money(result.get('price'), result.get('currency') or 'USD')}")
+    quote_date = result.get("quote_date") or "date unavailable"
+    st.caption(f"{selected} · {result.get('sector') or 'Unknown sector'} · Daily close {money(result.get('price'), result.get('currency') or 'USD')} · Alpha Vantage as of {quote_date}")
     as_of = (result.get("base_assumptions") or {}).get("valuation_date")
-    st.caption(f"Model valuation date: {as_of or 'not available'} · Quote timestamp not supplied by the valuation engine")
+    st.caption(f"Model valuation date: {as_of or 'not available'}")
+
+    if result.get("sector_source") in {"fallback", "user"}:
+        sector_choices = ["Use generic defaults"] + sorted(
+            name
+            for name, config in SECTOR_CONFIGS.items()
+            if name != "Default" and not config.special_rules.get("disable_all")
+        )
+        current_choice = sector_override or "Use generic defaults"
+        choice_key = f"mobile_sector_choice_{selected}"
+        if st.session_state.get(choice_key) not in sector_choices:
+            st.session_state[choice_key] = current_choice
+        if result.get("sector_source") == "fallback":
+            st.warning("Sector data is unavailable. This valuation currently uses generic assumptions; select a sector to apply sector-specific methods and weights.")
+        selected_sector = st.selectbox("Valuation sector", sector_choices, key=choice_key)
+        if st.button("Apply sector", disabled=selected_sector == current_choice):
+            if selected_sector == "Use generic defaults":
+                st.session_state.pop(sector_override_key, None)
+            else:
+                st.session_state[sector_override_key] = selected_sector
+            st.rerun()
 
     investment_score = build_investment_score(result, result.get("fundamental_confirmation"))
     view = st.segmented_control("Analysis section", VIEWS, default="Overview", key="mobile_view", label_visibility="collapsed")
@@ -389,7 +421,7 @@ def main():
     elif view == "Quality":
         render_fundamentals(result)
     elif view == "History":
-        render_history(selected, result)
+        render_history(selected, result, sector_override)
     else:
         render_overview(result, investment_score)
 

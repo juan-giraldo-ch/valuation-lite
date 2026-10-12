@@ -14,7 +14,6 @@ Improvements:
 - AUTO-CALIBRATING: Detects growth profile & adjusts assumptions automatically
 """
 
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import json
@@ -32,6 +31,7 @@ from sector_config import (
     SectorConfig,
 )
 from config import SUBUNIT_CURRENCIES
+from alpha_vantage import AlphaVantageError, AlphaVantageTicker, get_fx_rate as fetch_alpha_fx
 
 logger = logging.getLogger(__name__)
 
@@ -1520,7 +1520,7 @@ def get_fx_rate(from_currency: str, to_currency: str):
     """Get FX rate so that 1 unit of from_currency equals X units of to_currency.
 
     Handles sub-unit currencies (GBp, GBX, ZAC) defined in config.SUBUNIT_CURRENCIES
-    by normalising to parent currencies before any yfinance lookup.
+    by normalising to parent currencies before any provider lookup.
     E.g. get_fx_rate('GBP', 'GBp') -> 100.0  (1 GBP = 100 pence)
          get_fx_rate('GBp', 'GBP') -> 0.01
     """
@@ -1539,7 +1539,7 @@ def get_fx_rate(from_currency: str, to_currency: str):
         return from_scale / to_scale
 
     # Look up the parent-pair rate, then apply sub-unit scaling.
-    parent_rate = _fetch_yf_fx(from_parent, to_parent)
+    parent_rate = _fetch_alpha_fx(from_parent, to_parent)
     if parent_rate is None:
         return None
     # 1 from_currency = from_scale from_parent = from_scale * parent_rate to_parent
@@ -1548,35 +1548,13 @@ def get_fx_rate(from_currency: str, to_currency: str):
     return (from_scale * parent_rate) / to_scale
 
 
-def _fetch_yf_fx(from_ccy: str, to_ccy: str):
-    """Raw yfinance FX lookup between two standard ISO currency codes."""
+def _fetch_alpha_fx(from_ccy: str, to_ccy: str):
+    """Get a daily FX rate between standard ISO currency codes."""
     try:
-        pair = f"{from_ccy}{to_ccy}=X"
-        data = yf.download(pair, period="5d", progress=False, auto_adjust=False)
-        if not data.empty and "Close" in data.columns:
-            series = data["Close"]
-            if isinstance(series, pd.DataFrame):
-                series = series.iloc[:, 0]
-            series = series.dropna()
-            if not series.empty and series.iloc[-1] > 0:
-                return float(series.iloc[-1])
-    except Exception:
-        pass
-
-    try:
-        pair = f"{to_ccy}{from_ccy}=X"
-        data = yf.download(pair, period="5d", progress=False, auto_adjust=False)
-        if not data.empty and "Close" in data.columns:
-            series = data["Close"]
-            if isinstance(series, pd.DataFrame):
-                series = series.iloc[:, 0]
-            series = series.dropna()
-            if not series.empty and series.iloc[-1] > 0:
-                return 1.0 / float(series.iloc[-1])
-    except Exception:
-        pass
-
-    return None
+        return fetch_alpha_fx(from_ccy, to_ccy)
+    except AlphaVantageError as exc:
+        logger.warning("Alpha Vantage FX lookup failed for %s/%s: %s", from_ccy, to_ccy, exc)
+        return None
 
 
 # =====================
@@ -3366,22 +3344,27 @@ def calculate_fundamental_confirmation(stock, info):
     return {"status": status, "score": score, "phrase": f"{status} - {score}/100 based on {len(available)} statement trends.", "breakdown": breakdown}
 
 
-def fetch_yahoo_metadata(ticker, attempts=3, retry_delay=0.75):
-    """Fetch Yahoo metadata with retries for transient crumb and rate-limit failures."""
+def fetch_market_metadata(ticker, attempts=3, retry_delay=0.75):
+    """Fetch Alpha Vantage metadata, retrying only unexpected transient errors."""
     last_error = None
+    last_attempt = 0
     for attempt in range(1, attempts + 1):
+        last_attempt = attempt
         try:
-            stock = yf.Ticker(ticker)
+            stock = AlphaVantageTicker(ticker)
             info = stock.info
             if isinstance(info, dict) and info:
                 return stock, info, None
-            last_error = "Yahoo Finance returned empty metadata"
+            last_error = "Alpha Vantage returned empty metadata"
+        except AlphaVantageError as exc:
+            last_error = str(exc)
+            break
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
 
         if attempt < attempts:
             logger.warning(
-                "[%s] Yahoo metadata attempt %d/%d failed: %s; retrying",
+                "[%s] Alpha Vantage metadata attempt %d/%d failed: %s; retrying",
                 ticker,
                 attempt,
                 attempts,
@@ -3389,11 +3372,29 @@ def fetch_yahoo_metadata(ticker, attempts=3, retry_delay=0.75):
             )
             time.sleep(retry_delay * attempt)
 
-    logger.warning("[%s] Yahoo metadata unavailable after %d attempts: %s", ticker, attempts, last_error)
+    logger.warning("[%s] Alpha Vantage metadata unavailable after %d attempts: %s", ticker, last_attempt, last_error)
     return None, None, last_error
 
 
-def compute_valuation_enhanced(ticker, use_historical_growth=True, assumptions_override=None):
+def resolve_valuation_sector(info, sector_override=None):
+    raw_sector = info.get("sector", "Unknown") or "Unknown"
+    sector, reason = get_valuation_sector_name(info)
+    if sector_override:
+        if sector_override not in SECTOR_CONFIGS:
+            raise ValueError(f"Unsupported manual sector: {sector_override}")
+        return raw_sector, sector_override, "user", "manual sector selection"
+    source = info.get("sectorSource") or "provider"
+    if sector in {"Unknown", "Default"}:
+        source = "fallback"
+    return raw_sector, sector, source, reason
+
+
+def compute_valuation_enhanced(
+    ticker,
+    use_historical_growth=True,
+    assumptions_override=None,
+    sector_override=None,
+):
     """
     Enhanced valuation with sector-aware method selection.
     
@@ -3402,12 +3403,11 @@ def compute_valuation_enhanced(ticker, use_historical_growth=True, assumptions_o
         dict with valuation metrics and quality indicators
     """
     
-    stock, info, metadata_error = fetch_yahoo_metadata(ticker)
+    stock, info, metadata_error = fetch_market_metadata(ticker)
     if info is None:
         return {
             "error": (
-                f"Yahoo Finance metadata is temporarily unavailable for {ticker}: {metadata_error}. "
-                "Please retry shortly."
+                f"Could not load Alpha Vantage data for {ticker}: {metadata_error}"
             )
         }
     
@@ -3419,8 +3419,9 @@ def compute_valuation_enhanced(ticker, use_historical_growth=True, assumptions_o
     price_change_1y = info.get("52WeekChange")
     currency = info.get("currency", "USD")
     financial_currency = info.get("financialCurrency", currency)
-    raw_sector = info.get("sector", "Unknown")
-    sector, sector_override_reason = get_valuation_sector_name(info)
+    raw_sector, sector, sector_source, sector_override_reason = resolve_valuation_sector(
+        info, sector_override
+    )
 
     # Instruments with disable_all must exit before the price check so that
     # NOT_APPLICABLE / UNSUPPORTED_REGIME codes are always returned.
@@ -3441,9 +3442,15 @@ def compute_valuation_enhanced(ticker, use_historical_growth=True, assumptions_o
         return {"error": f"No valid price data for {ticker}", "name": name}
     
     # Data quality check
-    quality_flags = []
+    quality_flags = list(info.get("providerWarnings") or [])
     assumption_deltas = {}
     policy_metadata = get_policy_metadata()
+    if sector_source == "fallback":
+        quality_flags.append(
+            "Sector classification is unavailable; generic default sector assumptions are in use."
+        )
+    elif sector_source == "user":
+        quality_flags.append(f"Sector classification supplied manually: {sector}.")
     if sector_override_reason:
         quality_flags.append(
             f"Valuation sector override applied: {raw_sector} -> {sector} ({sector_override_reason})"
@@ -4229,9 +4236,11 @@ def compute_valuation_enhanced(ticker, use_historical_growth=True, assumptions_o
 
     base_assumptions = {
         "valuation_date": datetime.now().strftime("%Y-%m-%d"),
+        "quote_date": info.get("quoteDate"),
         "ticker": ticker,
         "sector": sector,
         "raw_sector": raw_sector,
+        "sector_source": sector_source,
         "industry": info.get("industry"),
         "price": price,
         "currency": currency,
@@ -4291,6 +4300,7 @@ def compute_valuation_enhanced(ticker, use_historical_growth=True, assumptions_o
         "financial_currency": financial_currency,
         "fx_financial_to_quote": fx_fin_to_quote,
         "price": price,
+        "quote_date": info.get("quoteDate"),
         "price_change_1d": price_change_1d,
         "price_change_1y": price_change_1y,
         "discount_rate": discount_rate,
@@ -4341,7 +4351,12 @@ def compute_valuation_enhanced(ticker, use_historical_growth=True, assumptions_o
     }
 
 
-def compute_historical_valuations(ticker, months_back=12, assumptions_override=None):
+def compute_historical_valuations(
+    ticker,
+    months_back=12,
+    assumptions_override=None,
+    sector_override=None,
+):
     """
     Backfill historical fair values using quarterly financial data.
     This lets you see how fair value has evolved over time immediately,
@@ -4355,12 +4370,11 @@ def compute_historical_valuations(ticker, months_back=12, assumptions_override=N
         dict with historical fair value data points keyed by date
     """
     
-    stock, info, metadata_error = fetch_yahoo_metadata(ticker)
+    stock, info, metadata_error = fetch_market_metadata(ticker)
     if info is None:
         return {
             "error": (
-                f"Yahoo Finance metadata is temporarily unavailable for {ticker}: {metadata_error}. "
-                "Please retry shortly."
+                f"Could not load Alpha Vantage data for {ticker}: {metadata_error}"
             )
         }
     name = info.get("shortName", ticker)
@@ -4455,7 +4469,7 @@ def compute_historical_valuations(ticker, months_back=12, assumptions_override=N
     logger.info(f"[{ticker}] Computing historical valuations for {months_back} months")
     
     try:
-        prices_hist = stock.history(start=start_date, end=end_date)
+        prices_hist = stock.history(start=start_date, end=end_date, interval="1mo")
         # Strip timezone to avoid naive/aware datetime mismatch
         if prices_hist.index.tz is not None:
             prices_hist.index = prices_hist.index.tz_localize(None)
@@ -4522,8 +4536,7 @@ def compute_historical_valuations(ticker, months_back=12, assumptions_override=N
     
     # Precompute sector context and growth diagnostics once; per-period valuation
     # then reuses the same enhanced engine functions as current valuation.
-    raw_sector = info.get("sector", "Unknown")
-    sector, _ = get_valuation_sector_name(info)
+    raw_sector, sector, sector_source, _ = resolve_valuation_sector(info, sector_override)
     sector_config = get_sector_config(sector)
 
     policy_confidence = float(sector_config.policy_confidence or sector_config.base_confidence)
@@ -5050,6 +5063,7 @@ def compute_historical_valuations(ticker, months_back=12, assumptions_override=N
         "currency": currency,
         "sector": sector,
         "raw_sector": raw_sector,
+        "sector_source": sector_source,
         "historical_valuations": historical_valuations,
         "lag_policy": {
             "fallback_days": 45,
